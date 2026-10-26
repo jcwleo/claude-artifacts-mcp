@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
+import type { Page } from "playwright-core";
 import { type BrowserHost, profileHolder } from "./browser.ts";
 import {
   type Api,
@@ -56,6 +57,13 @@ const SETTLE_SCRIPT = `new Promise((resolve) => {
 
 const TWO_FRAMES = "new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))";
 
+async function typeText(page: Page, text: string): Promise<void> {
+  for (const [index, line] of text.split(/\r?\n/).entries()) {
+    if (index > 0) await page.keyboard.press("Shift+Enter");
+    if (line) await page.keyboard.insertText(line);
+  }
+}
+
 export type PreviewImage = {
   file: string;
   width: number;
@@ -81,7 +89,7 @@ export class Designs {
   async #ensureApi(): Promise<Api> {
     if (this.#api) return this.#api;
     const page = await this.#browser.view("rpc");
-    await page.navigate(DESIGN_HOME);
+    await page.goto(DESIGN_HOME, { waitUntil: "domcontentloaded" });
     let lastTitle = "";
     const state = await pollFor(
       async () => {
@@ -161,7 +169,7 @@ export class Designs {
     }
   }
 
-  async #submit(api: Api, page: Bun.WebView, projectId: string, sessionId: string, text: string): Promise<void> {
+  async #submit(api: Api, page: Page, projectId: string, sessionId: string, text: string): Promise<void> {
     await pollFor(
       async () => ((await page.evaluate("!!document.querySelector('[data-testid=chat-input]')")) ? true : null),
       30_000,
@@ -179,14 +187,14 @@ export class Designs {
       return true;
     })()`);
     if (!focused) throw new Error("The design composer input disappeared before typing");
-    await page.type(text);
+    await typeText(page, text);
     const clicked = await page.evaluate(`(() => {
       const button = document.querySelector('[data-testid=chat-input-send]');
       if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') return false;
       button.click();
       return true;
     })()`);
-    if (!clicked) await page.press("Enter");
+    if (!clicked) await page.keyboard.press("Enter");
     await pollFor(
       async () => ((await this.#promptCount(api, sessionId)) > before ? true : null),
       45_000,
@@ -200,7 +208,7 @@ export class Designs {
     const api = await this.#ensureApi();
     const page = await this.#browser.view("composer");
     try {
-      await page.navigate(DESIGN_HOME);
+      await page.goto(DESIGN_HOME, { waitUntil: "domcontentloaded" });
       await pollFor(
         async () =>
           (await page.evaluate(`((labels) => {
@@ -238,7 +246,7 @@ export class Designs {
         ...(titleWarning ? { warning: titleWarning } : {}),
       };
     } finally {
-      this.#browser.close("composer");
+      await this.#browser.close("composer");
     }
   }
 
@@ -262,10 +270,10 @@ export class Designs {
     }
     const page = await this.#browser.view("composer");
     try {
-      await page.navigate(designUrl(params.projectId, sessionId));
+      await page.goto(designUrl(params.projectId, sessionId), { waitUntil: "domcontentloaded" });
       await this.#submit(api, page, params.projectId, sessionId, params.message);
     } finally {
-      this.#browser.close("composer");
+      await this.#browser.close("composer");
     }
     return { projectId: params.projectId, sessionId, url: designUrl(params.projectId, sessionId), status: "generating" };
   }
@@ -327,7 +335,7 @@ export class Designs {
       for (const rel of candidates.slice(0, maxImages)) images.push(await this.#render(server.port ?? 0, rel, width));
     } finally {
       server.stop(true);
-      this.#browser.close("preview");
+      await this.#browser.close("preview");
     }
     return {
       projectId: params.projectId,
@@ -340,20 +348,20 @@ export class Designs {
 
   async #render(port: number, rel: string, width: number): Promise<PreviewImage> {
     const page = await this.#browser.view("preview");
-    await page.resize(width, 900);
-    await page.navigate(`http://127.0.0.1:${port}/${rel.split("/").map(encodeURIComponent).join("/")}`);
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto(`http://127.0.0.1:${port}/${rel.split("/").map(encodeURIComponent).join("/")}`, { waitUntil: "load" });
     await page.evaluate(SETTLE_SCRIPT);
     const size = (await page.evaluate(
       "({ w: Math.max(document.documentElement.scrollWidth, document.body ? document.body.scrollWidth : 0), h: Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0) })",
     )) as { w: number; h: number };
     const finalWidth = Math.min(Math.max(size.w, width), MAX_PREVIEW_WIDTH);
     const finalHeight = Math.min(Math.max(size.h, 300), MAX_PREVIEW_HEIGHT);
-    await page.resize(finalWidth, finalHeight);
+    await page.setViewportSize({ width: finalWidth, height: finalHeight });
     await page.evaluate(TWO_FRAMES);
-    let data = (await page.screenshot({ format: "png", encoding: "base64" })) as string;
+    let data = (await page.screenshot({ type: "png" })).toString("base64");
     let mimeType: PreviewImage["mimeType"] = "image/png";
     if (data.length > MAX_IMAGE_BASE64) {
-      data = (await page.screenshot({ format: "jpeg", quality: 80, encoding: "base64" })) as string;
+      data = (await page.screenshot({ type: "jpeg", quality: 80 })).toString("base64");
       mimeType = "image/jpeg";
     }
     return { file: rel, width: finalWidth, height: finalHeight, truncated: size.h > finalHeight, mimeType, data };

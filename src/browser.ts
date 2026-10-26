@@ -1,5 +1,6 @@
 import { readlinkSync } from "node:fs";
 import { join } from "node:path";
+import { type BrowserContext, type Page, chromium } from "playwright-core";
 import { CHROME_PATH, LOGIN_URL, PROFILE_DIR } from "./paths.ts";
 
 export class LoginWindowOpenError extends Error {
@@ -53,49 +54,60 @@ async function waitForProfileRelease(timeoutMs: number): Promise<void> {
 }
 
 export class BrowserHost {
-  #views = new Map<string, Bun.WebView>();
-  #chromeRunning = false;
+  #context: BrowserContext | null = null;
+  #pages = new Map<string, Page>();
 
-  async view(name: string): Promise<Bun.WebView> {
-    const existing = this.#views.get(name);
-    if (existing) return existing;
-    if (!this.#chromeRunning) {
-      const holder = await profileHolder();
-      if (holder.kind === "login-window") throw new LoginWindowOpenError();
-      if (holder.kind === "headless") {
-        process.kill(holder.pid, "SIGTERM");
-        await waitForProfileRelease(10_000);
-      }
+  async #ensureContext(): Promise<BrowserContext> {
+    if (this.#context) return this.#context;
+    const holder = await profileHolder();
+    if (holder.kind === "login-window") throw new LoginWindowOpenError();
+    if (holder.kind === "headless") {
+      process.kill(holder.pid, "SIGTERM");
+      await waitForProfileRelease(10_000);
     }
-    const view = new Bun.WebView({
-      width: 1440,
-      height: 900,
-      backend: { type: "chrome", path: CHROME_PATH, argv: ["--lang=en-US"] },
-      dataStore: { directory: PROFILE_DIR },
+    const context = await chromium.launchPersistentContext(PROFILE_DIR, {
+      executablePath: CHROME_PATH,
+      headless: true,
+      viewport: { width: 1440, height: 900 },
+      locale: "en-US",
     });
-    this.#chromeRunning = true;
-    this.#views.set(name, view);
-    return view;
+    context.setDefaultNavigationTimeout(60_000);
+    context.once("close", () => {
+      if (this.#context !== context) return;
+      this.#context = null;
+      this.#pages.clear();
+    });
+    this.#context = context;
+    return context;
   }
 
-  close(name: string): void {
-    this.#views.get(name)?.close();
-    this.#views.delete(name);
+  async view(name: string): Promise<Page> {
+    const existing = this.#pages.get(name);
+    if (existing && !existing.isClosed()) return existing;
+    const page = await (await this.#ensureContext()).newPage();
+    this.#pages.set(name, page);
+    return page;
   }
 
-  shutdown(): void {
-    for (const view of this.#views.values()) view.close();
-    this.#views.clear();
-    if (this.#chromeRunning) Bun.WebView.closeAll();
-    this.#chromeRunning = false;
+  async close(name: string): Promise<void> {
+    const page = this.#pages.get(name);
+    this.#pages.delete(name);
+    await page?.close();
+  }
+
+  async shutdown(): Promise<void> {
+    const context = this.#context;
+    this.#context = null;
+    this.#pages.clear();
+    await context?.close();
   }
 
   get running(): boolean {
-    return this.#chromeRunning;
+    return this.#context !== null;
   }
 
   async openLoginWindow(): Promise<"opened" | "already-open"> {
-    this.shutdown();
+    await this.shutdown();
     const holder = await profileHolder();
     if (holder.kind === "login-window") return "already-open";
     if (holder.kind === "headless") process.kill(holder.pid, "SIGTERM");

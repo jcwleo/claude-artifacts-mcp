@@ -7,7 +7,7 @@ import { SOCKET_PATH, STATE_DIR } from "./paths.ts";
 import { type DaemonRequest, type DaemonResponse, LineDecoder, encodeLine } from "./protocol.ts";
 
 const IDLE_MS = Number(process.env.CLAUDE_DESIGN_IDLE_MS ?? 30 * 60_000);
-const BROWSER_GONE = /WebView closed|Chrome process|Chrome killed|closed the pipe|host process died/i;
+const BROWSER_GONE = /Target page, context or browser has been closed|Browser has been closed|browser has disconnected/i;
 
 const browser = new BrowserHost();
 const designs = new Designs(browser);
@@ -68,7 +68,7 @@ async function handle(request: DaemonRequest): Promise<DaemonResponse> {
     const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
     if (error instanceof NotLoggedInError) designs.reset();
     if (BROWSER_GONE.test(message)) {
-      browser.shutdown();
+      await browser.shutdown();
       designs.reset();
     }
     return { id: request.id, ok: false, error: message };
@@ -109,9 +109,9 @@ const server = net.createServer((socket) => {
   });
 });
 
-function stop(reason: string): never {
+async function stop(reason: string): Promise<never> {
   console.error(`[claude-design daemon] stopping: ${reason}`);
-  browser.shutdown();
+  await browser.shutdown().catch((error: unknown) => console.error(`[claude-design daemon] browser shutdown failed: ${String(error)}`));
   server.close();
   rmSync(SOCKET_PATH, { force: true });
   process.exit(0);
@@ -129,7 +129,7 @@ server.listen(SOCKET_PATH, () => {
   console.error(`[claude-design daemon] pid ${process.pid} listening on ${SOCKET_PATH}`);
 });
 setInterval(() => {
-  if (inFlight === 0 && Date.now() - lastActivity > IDLE_MS) stop("idle");
+  if (inFlight === 0 && Date.now() - lastActivity > IDLE_MS) void stop("idle");
 }, 60_000);
-process.on("SIGTERM", () => stop("SIGTERM"));
-process.on("SIGINT", () => stop("SIGINT"));
+process.on("SIGTERM", () => void stop("SIGTERM"));
+process.on("SIGINT", () => void stop("SIGINT"));
