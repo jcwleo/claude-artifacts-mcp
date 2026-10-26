@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
+import { stat } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -47,22 +47,15 @@ async function previewContent(projectId: string, options: { file?: string; width
   ];
 }
 
-async function projectDir(): Promise<string> {
-  if (server.server.getClientCapabilities()?.roots) {
-    const { roots } = await server.server.listRoots();
-    const root = roots.find((item) => item.uri.startsWith("file://"));
-    if (root) return fileURLToPath(root.uri);
-  }
-  return process.cwd();
-}
-
-async function pullSource(projectId: string, dir: string | undefined): Promise<Record<string, unknown>> {
-  const project = await projectDir();
-  const target = dir ? { dir: isAbsolute(dir) ? dir : resolve(project, dir) } : { baseDir: join(project, "claude-design") };
+async function pullSource(projectId: string, projectDir: string, dir: string | undefined): Promise<Record<string, unknown>> {
+  if (!isAbsolute(projectDir)) throw new Error(`projectDir must be an absolute path, got: ${projectDir}`);
+  const isDirectory = await stat(projectDir).then((info) => info.isDirectory(), () => false);
+  if (!isDirectory) throw new Error(`projectDir is not an existing directory: ${projectDir}`);
+  const target = dir ? { dir: isAbsolute(dir) ? dir : resolve(projectDir, dir) } : { baseDir: join(projectDir, "claude-design") };
   return callDaemon("pull", { projectId, ...target }, 180_000);
 }
 
-type SettleOptions = { timeoutSec: number; preview: boolean; pull: boolean; dir?: string };
+type SettleOptions = { timeoutSec: number; preview: boolean; pull: boolean; projectDir: string; dir?: string };
 
 async function settleAndShow(projectId: string, base: Record<string, unknown>, options: SettleOptions): Promise<Content[]> {
   const state = await waitForTurn(projectId, options.timeoutSec);
@@ -70,7 +63,7 @@ async function settleAndShow(projectId: string, base: Record<string, unknown>, o
   let source: Record<string, unknown> = {};
   if (options.pull) {
     try {
-      source = { source: await pullSource(projectId, options.dir) };
+      source = { source: await pullSource(projectId, options.projectDir, options.dir) };
     } catch (error) {
       source = { sourceError: error instanceof Error ? error.message : String(error) };
     }
@@ -88,11 +81,15 @@ const waitShape = {
   wait: z.boolean().default(true).describe("Wait for Claude Design to finish before returning."),
   timeoutSec: z.number().int().min(10).max(1800).default(DEFAULT_WAIT_SEC).describe("How long to wait before returning a still-generating status."),
   preview: z.boolean().default(true).describe("Attach preview images when the design is done."),
-  pull: z.boolean().default(true).describe("Download the design's source files into the project when the design is done."),
+  pull: z.boolean().default(true).describe("Download the design's source files into projectDir when the design is done."),
+  projectDir: z
+    .string()
+    .min(1)
+    .describe("Absolute path of the project you are working in, normally your current working directory. Source files are saved inside it."),
   dir: z
     .string()
     .optional()
-    .describe("Where to save the source files; relative paths resolve against the project folder. Default: <project>/claude-design/<design-name>-<id>/."),
+    .describe("Where to save the source files; relative paths resolve against projectDir. Default: <projectDir>/claude-design/<design-name>-<id>/."),
 };
 
 const STATUS_GUIDE =
@@ -142,11 +139,11 @@ server.registerTool(
       ...waitShape,
     },
   },
-  ({ prompt, name, wait, timeoutSec, preview, pull, dir }) =>
+  ({ prompt, name, wait, timeoutSec, preview, pull, projectDir, dir }) =>
     run(async () => {
       const created = await callDaemon<CheckResult>("create", { prompt, name }, 180_000);
       if (!wait) return [text(created)];
-      return settleAndShow(String(created.projectId), created, { timeoutSec, preview, pull, dir });
+      return settleAndShow(String(created.projectId), created, { timeoutSec, preview, pull, projectDir, dir });
     }),
 );
 
@@ -160,10 +157,12 @@ server.registerTool(
       timeoutSec: waitShape.timeoutSec,
       preview: waitShape.preview,
       pull: waitShape.pull,
+      projectDir: waitShape.projectDir,
       dir: waitShape.dir,
     },
   },
-  ({ projectId, timeoutSec, preview, pull, dir }) => run(() => settleAndShow(projectId, {}, { timeoutSec, preview, pull, dir })),
+  ({ projectId, timeoutSec, preview, pull, projectDir, dir }) =>
+    run(() => settleAndShow(projectId, {}, { timeoutSec, preview, pull, projectDir, dir })),
 );
 
 server.registerTool(
@@ -177,11 +176,11 @@ server.registerTool(
       ...waitShape,
     },
   },
-  ({ projectId, message, wait, timeoutSec, preview, pull, dir }) =>
+  ({ projectId, message, wait, timeoutSec, preview, pull, projectDir, dir }) =>
     run(async () => {
       const sent = await callDaemon<CheckResult>("reply", { projectId, message }, 180_000);
       if (!wait) return [text(sent)];
-      return settleAndShow(projectId, sent, { timeoutSec, preview, pull, dir });
+      return settleAndShow(projectId, sent, { timeoutSec, preview, pull, projectDir, dir });
     }),
 );
 
@@ -208,10 +207,11 @@ server.registerTool(
       "Download a design's source files (.dc.html artboards, support.js runtime, uploaded assets) into the project so work can continue locally. Files with the same name are overwritten.",
     inputSchema: {
       projectId: z.string().min(1),
+      projectDir: waitShape.projectDir,
       dir: waitShape.dir,
     },
   },
-  ({ projectId, dir }) => run(async () => [text(await pullSource(projectId, dir))]),
+  ({ projectId, projectDir, dir }) => run(async () => [text(await pullSource(projectId, projectDir, dir))]),
 );
 
 await server.connect(new StdioServerTransport());
