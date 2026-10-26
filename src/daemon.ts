@@ -7,6 +7,7 @@ import { SOCKET_PATH, STATE_DIR } from "./paths.ts";
 import { type DaemonRequest, type DaemonResponse, LineDecoder, encodeLine } from "./protocol.ts";
 
 const IDLE_MS = Number(process.env.CLAUDE_DESIGN_IDLE_MS ?? 30 * 60_000);
+const BROWSER_IDLE_MS = Number(process.env.CLAUDE_DESIGN_BROWSER_IDLE_MS ?? 5 * 60_000);
 const BROWSER_GONE = /Target page, context or browser has been closed|Browser has been closed|browser has disconnected/i;
 
 const browser = new BrowserHost();
@@ -129,7 +130,12 @@ server.listen(SOCKET_PATH, () => {
   console.error(`[claude-design daemon] pid ${process.pid} listening on ${SOCKET_PATH}`);
 });
 setInterval(() => {
-  if (inFlight === 0 && Date.now() - lastActivity > IDLE_MS) void stop("idle");
+  const idleFor = Date.now() - lastActivity;
+  if (inFlight === 0 && idleFor > IDLE_MS) void stop("idle");
+  else if (inFlight === 0 && idleFor > BROWSER_IDLE_MS && browser.running) {
+    designs.reset();
+    void browser.shutdown().catch((error: unknown) => console.error(`[claude-design daemon] browser shutdown failed: ${String(error)}`));
+  }
 }, 60_000);
 process.on("SIGTERM", () => void stop("SIGTERM"));
 process.on("SIGINT", () => void stop("SIGINT"));

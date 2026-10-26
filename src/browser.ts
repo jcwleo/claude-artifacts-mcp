@@ -10,7 +10,7 @@ export class LoginWindowOpenError extends Error {
   }
 }
 
-type ProfileHolder = { kind: "none" } | { kind: "login-window" | "headless"; pid: number };
+type ProfileHolder = { kind: "none" } | { kind: "login-window" | "automation"; pid: number };
 
 function lockPid(): number | null {
   try {
@@ -42,7 +42,7 @@ export async function profileHolder(): Promise<ProfileHolder> {
   if (pid === null || !isAlive(pid)) return { kind: "none" };
   const args = await commandLine(pid);
   if (!args.includes(PROFILE_DIR)) return { kind: "none" };
-  return { kind: args.includes("--headless") ? "headless" : "login-window", pid };
+  return { kind: args.includes("--remote-debugging-pipe") ? "automation" : "login-window", pid };
 }
 
 async function waitForProfileRelease(timeoutMs: number): Promise<void> {
@@ -61,13 +61,16 @@ export class BrowserHost {
     if (this.#context) return this.#context;
     const holder = await profileHolder();
     if (holder.kind === "login-window") throw new LoginWindowOpenError();
-    if (holder.kind === "headless") {
+    if (holder.kind === "automation") {
       process.kill(holder.pid, "SIGTERM");
       await waitForProfileRelease(10_000);
     }
+    // Headless Chrome stops at claude.ai's Cloudflare check, so the design profile runs as a normal window.
+    // Playwright's mock keychain cannot decrypt the cookies the login window stored, which signs the profile out.
     const context = await chromium.launchPersistentContext(PROFILE_DIR, {
       executablePath: CHROME_PATH,
-      headless: true,
+      headless: false,
+      ignoreDefaultArgs: ["--use-mock-keychain"],
       viewport: { width: 1440, height: 900 },
       locale: "en-US",
     });
@@ -110,7 +113,7 @@ export class BrowserHost {
     await this.shutdown();
     const holder = await profileHolder();
     if (holder.kind === "login-window") return "already-open";
-    if (holder.kind === "headless") process.kill(holder.pid, "SIGTERM");
+    if (holder.kind === "automation") process.kill(holder.pid, "SIGTERM");
     await waitForProfileRelease(10_000);
     const appBundle = CHROME_PATH.replace(/\/Contents\/MacOS\/[^/]+$/, "");
     const child = Bun.spawn(
