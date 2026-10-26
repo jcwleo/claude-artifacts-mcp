@@ -1,11 +1,11 @@
 #!/usr/bin/env bun
 import { isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import type { PreviewImage } from "./design.ts";
 import { callDaemon } from "./ipc.ts";
-import { STATE_DIR } from "./paths.ts";
 
 const POLL_MS = 10_000;
 const DEFAULT_WAIT_SEC = Number(process.env.CLAUDE_DESIGN_WAIT_SEC ?? 240);
@@ -47,10 +47,36 @@ async function previewContent(projectId: string, options: { file?: string; width
   ];
 }
 
-async function settleAndShow(projectId: string, base: Record<string, unknown>, timeoutSec: number, preview: boolean): Promise<Content[]> {
-  const state = await waitForTurn(projectId, timeoutSec);
-  const summary = text({ ...base, ...state });
-  if (state.status !== "done" || !preview) return [summary];
+async function projectDir(): Promise<string> {
+  if (server.server.getClientCapabilities()?.roots) {
+    const { roots } = await server.server.listRoots();
+    const root = roots.find((item) => item.uri.startsWith("file://"));
+    if (root) return fileURLToPath(root.uri);
+  }
+  return process.cwd();
+}
+
+async function pullSource(projectId: string, dir: string | undefined): Promise<Record<string, unknown>> {
+  const project = await projectDir();
+  const target = dir ? { dir: isAbsolute(dir) ? dir : resolve(project, dir) } : { baseDir: join(project, "claude-design") };
+  return callDaemon("pull", { projectId, ...target }, 180_000);
+}
+
+type SettleOptions = { timeoutSec: number; preview: boolean; pull: boolean; dir?: string };
+
+async function settleAndShow(projectId: string, base: Record<string, unknown>, options: SettleOptions): Promise<Content[]> {
+  const state = await waitForTurn(projectId, options.timeoutSec);
+  if (state.status !== "done") return [text({ ...base, ...state })];
+  let source: Record<string, unknown> = {};
+  if (options.pull) {
+    try {
+      source = { source: await pullSource(projectId, options.dir) };
+    } catch (error) {
+      source = { sourceError: error instanceof Error ? error.message : String(error) };
+    }
+  }
+  const summary = text({ ...base, ...state, ...source });
+  if (!options.preview) return [summary];
   try {
     return [summary, ...(await previewContent(projectId))];
   } catch (error) {
@@ -62,10 +88,15 @@ const waitShape = {
   wait: z.boolean().default(true).describe("Wait for Claude Design to finish before returning."),
   timeoutSec: z.number().int().min(10).max(1800).default(DEFAULT_WAIT_SEC).describe("How long to wait before returning a still-generating status."),
   preview: z.boolean().default(true).describe("Attach preview images when the design is done."),
+  pull: z.boolean().default(true).describe("Download the design's source files into the project when the design is done."),
+  dir: z
+    .string()
+    .optional()
+    .describe("Where to save the source files; relative paths resolve against the project folder. Default: <project>/claude-design/<design-name>-<id>/."),
 };
 
 const STATUS_GUIDE =
-  "Statuses: generating (still working), done (files changed; previews attached), awaiting_input (reason permission: the user must open url and approve in claude.ai, never approve for them; reason question: answer with design_reply), no_output (turn ended without changing files), stalled (no activity for 10 minutes).";
+  "Statuses: generating (still working), done (files changed; source files saved into the project and previews attached), awaiting_input (reason permission: the user must open url and approve in claude.ai, never approve for them; reason question: answer with design_reply), no_output (turn ended without changing files), stalled (no activity for 10 minutes).";
 
 const server = new McpServer({ name: "claude-design", version: "0.1.0" });
 
@@ -104,18 +135,18 @@ server.registerTool(
   "design_create",
   {
     title: "Create a design",
-    description: `Ask Claude Design (claude.ai Design artifact, on the user's own account) to generate a new design from a prompt, such as a web app screen or a dashboard. Claude Design itself produces the design; generation usually takes several minutes. Returns projectId, url, the status and, once done, preview images. ${STATUS_GUIDE}`,
+    description: `Ask Claude Design (claude.ai Design artifact, on the user's own account) to generate a new design from a prompt, such as a web app screen or a dashboard. Claude Design itself produces the design; generation usually takes several minutes. Returns projectId, url, the status and, once done, the saved source location and preview images. ${STATUS_GUIDE}`,
     inputSchema: {
       prompt: z.string().min(1).describe("The design brief: goal, layout, content and audience."),
       name: z.string().min(1).max(80).optional().describe("Title for the design in claude.ai."),
       ...waitShape,
     },
   },
-  ({ prompt, name, wait, timeoutSec, preview }) =>
+  ({ prompt, name, wait, timeoutSec, preview, pull, dir }) =>
     run(async () => {
       const created = await callDaemon<CheckResult>("create", { prompt, name }, 180_000);
       if (!wait) return [text(created)];
-      return settleAndShow(String(created.projectId), created, timeoutSec, preview);
+      return settleAndShow(String(created.projectId), created, { timeoutSec, preview, pull, dir });
     }),
 );
 
@@ -123,14 +154,16 @@ server.registerTool(
   "design_wait",
   {
     title: "Wait for a design",
-    description: `Wait for Claude Design to finish the current turn of a design and return its status, Claude's reply and preview images. ${STATUS_GUIDE}`,
+    description: `Wait for Claude Design to finish the current turn of a design and return its status, Claude's reply, the saved source location and preview images. ${STATUS_GUIDE}`,
     inputSchema: {
       projectId: z.string().min(1),
       timeoutSec: waitShape.timeoutSec,
       preview: waitShape.preview,
+      pull: waitShape.pull,
+      dir: waitShape.dir,
     },
   },
-  ({ projectId, timeoutSec, preview }) => run(() => settleAndShow(projectId, {}, timeoutSec, preview)),
+  ({ projectId, timeoutSec, preview, pull, dir }) => run(() => settleAndShow(projectId, {}, { timeoutSec, preview, pull, dir })),
 );
 
 server.registerTool(
@@ -144,11 +177,11 @@ server.registerTool(
       ...waitShape,
     },
   },
-  ({ projectId, message, wait, timeoutSec, preview }) =>
+  ({ projectId, message, wait, timeoutSec, preview, pull, dir }) =>
     run(async () => {
       const sent = await callDaemon<CheckResult>("reply", { projectId, message }, 180_000);
       if (!wait) return [text(sent)];
-      return settleAndShow(projectId, sent, timeoutSec, preview);
+      return settleAndShow(projectId, sent, { timeoutSec, preview, pull, dir });
     }),
 );
 
@@ -172,17 +205,13 @@ server.registerTool(
   {
     title: "Download a design",
     description:
-      "Download a design's source files (.dc.html artboards, support.js runtime, uploaded assets) into a directory so they can be implemented in code. Pass an absolute dir inside the user's project.",
+      "Download a design's source files (.dc.html artboards, support.js runtime, uploaded assets) into the project so work can continue locally. Files with the same name are overwritten.",
     inputSchema: {
       projectId: z.string().min(1),
-      dir: z.string().optional().describe("Destination directory. Default: ~/.claude-design-mcp/designs/<projectId>."),
+      dir: waitShape.dir,
     },
   },
-  ({ projectId, dir }) =>
-    run(async () => {
-      const target = dir ? (isAbsolute(dir) ? dir : resolve(process.cwd(), dir)) : join(STATE_DIR, "designs", projectId);
-      return [text(await callDaemon("pull", { projectId, dir: target }, 180_000))];
-    }),
+  ({ projectId, dir }) => run(async () => [text(await pullSource(projectId, dir))]),
 );
 
 await server.connect(new StdioServerTransport());

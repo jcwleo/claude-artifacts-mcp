@@ -21,7 +21,7 @@ import {
   realPromptCount,
   signature,
 } from "./claude.ts";
-import { downloadDesign, previewCandidates } from "./files.ts";
+import { designFolderName, downloadDesign, previewCandidates } from "./files.ts";
 import { CACHE_DIR, DESIGN_HOME, designUrl } from "./paths.ts";
 import { readIndex, updateEntry } from "./store.ts";
 
@@ -367,10 +367,12 @@ export class Designs {
     return { file: rel, width: finalWidth, height: finalHeight, truncated: size.h > finalHeight, mimeType, data };
   }
 
-  async pull(params: { projectId: string; dir: string }): Promise<Record<string, unknown>> {
+  async pull(params: { projectId: string; dir?: string; baseDir?: string }): Promise<Record<string, unknown>> {
+    if (!params.dir && !params.baseDir) throw new Error("pull needs dir or baseDir");
     const api = await this.#ensureApi();
     const manifest = await getManifest(api, params.projectId);
-    const result = await downloadDesign(params.projectId, manifest, params.dir);
-    return { projectId: params.projectId, title: manifest.title, dir: resolve(params.dir), ...result };
+    const target = resolve(params.dir ?? join(params.baseDir as string, designFolderName(manifest.title, params.projectId)));
+    const result = await downloadDesign(params.projectId, manifest, target);
+    return { projectId: params.projectId, title: manifest.title, dir: target, ...result };
   }
 }

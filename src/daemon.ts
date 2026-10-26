@@ -45,7 +45,12 @@ const handlers: Record<string, (params: Params) => Promise<unknown>> = {
       width: optionalNumber(params, "width"),
       maxImages: optionalNumber(params, "maxImages"),
     }),
-  pull: (params) => designs.pull({ projectId: requiredString(params, "projectId"), dir: requiredString(params, "dir") }),
+  pull: (params) =>
+    designs.pull({
+      projectId: requiredString(params, "projectId"),
+      dir: optionalString(params, "dir"),
+      baseDir: optionalString(params, "baseDir"),
+    }),
 };
 
 let queue: Promise<unknown> = Promise.resolve();

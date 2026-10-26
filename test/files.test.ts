@@ -3,7 +3,16 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Manifest } from "../src/claude.ts";
-import { RUNTIME_PATH, blobIds, downloadDesign, previewCandidates, rewriteBlobRefs, safeRelPath, supportPathsFor } from "../src/files.ts";
+import {
+  RUNTIME_PATH,
+  blobIds,
+  designFolderName,
+  downloadDesign,
+  previewCandidates,
+  rewriteBlobRefs,
+  safeRelPath,
+  supportPathsFor,
+} from "../src/files.ts";
 import { LineDecoder } from "../src/protocol.ts";
 
 describe("path helpers", () => {
@@ -12,6 +21,14 @@ describe("path helpers", () => {
     expect(safeRelPath("/root.html")).toBe("root.html");
     expect(() => safeRelPath("../escape.html")).toThrow();
     expect(() => safeRelPath("a/../../escape.html")).toThrow();
+  });
+
+  test("designFolderName slugs the title, keeps the id prefix and never escapes the base dir", () => {
+    const id = "a1b2c3d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+    expect(designFolderName("MCP PoC test - reading dashboard", id)).toBe("mcp-poc-test-reading-dashboard-a1b2c3d4");
+    expect(designFolderName("독서 대시보드!", id)).toBe("독서-대시보드-a1b2c3d4");
+    expect(designFolderName("../..", id)).toBe("a1b2c3d4");
+    expect(designFolderName("", id)).toBe("a1b2c3d4");
   });
 
   test("support.js goes next to every .dc.html directory once", () => {

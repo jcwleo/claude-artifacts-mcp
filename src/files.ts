@@ -14,6 +14,17 @@ export function safeRelPath(rel: string): string {
   return normalized.normalize("NFC");
 }
 
+export function designFolderName(title: string, projectId: string): string {
+  const slug = title
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, "-")
+    .slice(0, 60)
+    .replace(/^-+|-+$/g, "");
+  const id = projectId.slice(0, 8);
+  return slug ? `${slug}-${id}` : id;
+}
+
 export function blobIds(text: string): string[] {
   return [...new Set([...text.matchAll(BLOB_REFERENCE)].map((match) => match[1] as string))];
 }
