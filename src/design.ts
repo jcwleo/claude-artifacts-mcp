@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import type { Page } from "playwright-core";
+import { type Annotation, type AnnotationOutcome, SUBMIT_BINDING, installAnnotator } from "./annotate.ts";
 import { type BrowserHost, profileHolder } from "./browser.ts";
 import {
   type Api,
@@ -57,6 +58,34 @@ const SETTLE_SCRIPT = `new Promise((resolve) => {
 
 const TWO_FRAMES = "new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))";
 
+type FileServer = ReturnType<typeof Bun.serve>;
+
+function serveDirectory(dir: string): FileServer {
+  const root = resolve(dir);
+  return Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const target = resolve(root, decodeURIComponent(new URL(request.url).pathname.slice(1)));
+      if (!target.startsWith(root + sep)) return new Response("forbidden", { status: 403 });
+      const file = Bun.file(target);
+      return (await file.exists()) ? new Response(file) : new Response("not found", { status: 404 });
+    },
+  });
+}
+
+function servedFileUrl(server: FileServer, rel: string): string {
+  return `http://127.0.0.1:${server.port}/${rel.split("/").map(encodeURIComponent).join("/")}`;
+}
+
+type PendingAnnotation = {
+  file: string;
+  pageName: string;
+  server: FileServer;
+  done: Promise<AnnotationOutcome>;
+  finish: (outcome: AnnotationOutcome) => void;
+};
+
 async function typeText(page: Page, text: string): Promise<void> {
   for (const [index, line] of text.split(/\r?\n/).entries()) {
     if (index > 0) await page.keyboard.press("Shift+Enter");
@@ -77,6 +106,7 @@ export class Designs {
   #browser: BrowserHost;
   #api: Api | null = null;
   #designType: string | null = null;
+  #annotations = new Map<string, PendingAnnotation>();
 
   constructor(browser: BrowserHost) {
     this.#browser = browser;
@@ -319,20 +349,10 @@ export class Designs {
     if (!candidates.length) throw new Error(`Design ${params.projectId} has no HTML file to preview yet`);
     const maxImages = Math.min(Math.max(Math.trunc(params.maxImages ?? 4), 1), 8);
     const width = Math.min(Math.max(Math.trunc(params.width ?? 1440), 320), MAX_PREVIEW_WIDTH);
-    const root = resolve(copy.dir);
-    const server = Bun.serve({
-      hostname: "127.0.0.1",
-      port: 0,
-      async fetch(request) {
-        const target = resolve(root, decodeURIComponent(new URL(request.url).pathname.slice(1)));
-        if (!target.startsWith(root + sep)) return new Response("forbidden", { status: 403 });
-        const file = Bun.file(target);
-        return (await file.exists()) ? new Response(file) : new Response("not found", { status: 404 });
-      },
-    });
+    const server = serveDirectory(copy.dir);
     const images: PreviewImage[] = [];
     try {
-      for (const rel of candidates.slice(0, maxImages)) images.push(await this.#render(server.port ?? 0, rel, width));
+      for (const rel of candidates.slice(0, maxImages)) images.push(await this.#render(server, rel, width));
     } finally {
       server.stop(true);
       await this.#browser.close("preview");
@@ -346,10 +366,10 @@ export class Designs {
     };
   }
 
-  async #render(port: number, rel: string, width: number): Promise<PreviewImage> {
+  async #render(server: FileServer, rel: string, width: number): Promise<PreviewImage> {
     const page = await this.#browser.view("preview");
     await page.setViewportSize({ width, height: 900 });
-    await page.goto(`http://127.0.0.1:${port}/${rel.split("/").map(encodeURIComponent).join("/")}`, { waitUntil: "load" });
+    await page.goto(servedFileUrl(server, rel), { waitUntil: "load" });
     await page.evaluate(SETTLE_SCRIPT);
     const size = (await page.evaluate(
       "({ w: Math.max(document.documentElement.scrollWidth, document.body ? document.body.scrollWidth : 0), h: Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0) })",
@@ -365,6 +385,60 @@ export class Designs {
       mimeType = "image/jpeg";
     }
     return { file: rel, width: finalWidth, height: finalHeight, truncated: size.h > finalHeight, mimeType, data };
+  }
+
+  async openAnnotation(params: { projectId: string; file?: string }): Promise<Record<string, unknown>> {
+    const api = await this.#ensureApi();
+    const sessionId = await this.#sessionFor(api, params.projectId);
+    const session = await getSession(api, sessionId);
+    if (session.worker_status && session.worker_status !== "idle") {
+      throw new Error(`Claude Design is still working on ${params.projectId}; call design_wait first`);
+    }
+    const manifest = await getManifest(api, params.projectId);
+    const copy = await this.#cachedCopy(params.projectId, manifest);
+    const file = params.file ? params.file.replace(/^project\//, "") : previewCandidates(copy.files)[0];
+    if (!file || !copy.files.includes(file)) {
+      throw new Error(`Design ${params.projectId} has no ${file ?? "HTML file"} to annotate; files: ${copy.files.join(", ")}`);
+    }
+    const id = crypto.randomUUID();
+    const pageName = `annotate:${id}`;
+    const server = serveDirectory(copy.dir);
+    let finish: (outcome: AnnotationOutcome) => void = () => {};
+    const done = new Promise<AnnotationOutcome>((resolveOutcome) => (finish = resolveOutcome));
+    try {
+      const page = await this.#browser.view(pageName);
+      await page.exposeFunction(SUBMIT_BINDING, (payload: { action: "send" | "cancel"; annotations?: Annotation[] }) =>
+        finish({ action: payload.action, file, annotations: payload.annotations ?? [] }),
+      );
+      page.once("close", () => finish({ action: "closed", file, annotations: [] }));
+      await page.goto(servedFileUrl(server, file), { waitUntil: "load" });
+      await page.evaluate(SETTLE_SCRIPT);
+      await page.evaluate(installAnnotator, file);
+      await page.bringToFront();
+    } catch (error) {
+      server.stop(true);
+      await this.#browser.close(pageName);
+      throw error;
+    }
+    this.#annotations.set(id, { file, pageName, server, done, finish });
+    return { annotationId: id, projectId: params.projectId, title: manifest.title, file };
+  }
+
+  async waitAnnotation(params: { annotationId: string; timeoutSec: number }): Promise<AnnotationOutcome> {
+    const pending = this.#annotations.get(params.annotationId);
+    if (!pending) throw new Error(`Unknown annotation ${params.annotationId}`);
+    const timer = setTimeout(
+      () => pending.finish({ action: "timeout", file: pending.file, annotations: [] }),
+      params.timeoutSec * 1000,
+    );
+    try {
+      return await pending.done;
+    } finally {
+      clearTimeout(timer);
+      this.#annotations.delete(params.annotationId);
+      pending.server.stop(true);
+      await this.#browser.close(pending.pageName);
+    }
   }
 
   async pull(params: { projectId: string; dir?: string; baseDir?: string }): Promise<Record<string, unknown>> {

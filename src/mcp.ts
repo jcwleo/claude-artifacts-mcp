@@ -4,11 +4,13 @@ import { isAbsolute, join, resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { type AnnotationOutcome, annotationMessage } from "./annotate.ts";
 import type { PreviewImage } from "./design.ts";
 import { callDaemon } from "./ipc.ts";
 
 const POLL_MS = 10_000;
 const DEFAULT_WAIT_SEC = Number(process.env.CLAUDE_DESIGN_WAIT_SEC ?? 240);
+const CALL_BUDGET_MS = 840_000;
 
 type Content = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 type CheckResult = Record<string, unknown> & { status?: string; projectId?: string };
@@ -181,6 +183,48 @@ server.registerTool(
       const sent = await callDaemon<CheckResult>("reply", { projectId, message }, 180_000);
       if (!wait) return [text(sent)];
       return settleAndShow(projectId, sent, { timeoutSec, preview, pull, projectDir, dir });
+    }),
+);
+
+server.registerTool(
+  "design_annotate",
+  {
+    title: "Annotate a design",
+    description: `Open a design in a Chrome window on the user's Mac where the user clicks elements and writes a comment on each one, then send all comments to Claude Design as one revision request. Use it when the user wants to point at parts of a design instead of describing them. The call waits while the user annotates, then waits for the revision like design_reply. ${STATUS_GUIDE}`,
+    inputSchema: {
+      projectId: z.string().min(1),
+      file: z.string().optional().describe("Artboard to annotate, e.g. Main.dc.html. Default: the first artboard."),
+      annotateTimeoutSec: z.number().int().min(30).max(600).default(420).describe("How long the user has to annotate before the window closes."),
+      timeoutSec: waitShape.timeoutSec,
+      preview: waitShape.preview,
+      pull: waitShape.pull,
+      projectDir: waitShape.projectDir,
+      dir: waitShape.dir,
+    },
+  },
+  ({ projectId, file, annotateTimeoutSec, timeoutSec, preview, pull, projectDir, dir }) =>
+    run(async () => {
+      const started = Date.now();
+      const opened = await callDaemon<{ annotationId: string; file: string }>("annotate_open", { projectId, file }, 120_000);
+      const outcome = await callDaemon<AnnotationOutcome>(
+        "annotate_wait",
+        { annotationId: opened.annotationId, timeoutSec: annotateTimeoutSec },
+        (annotateTimeoutSec + 30) * 1000,
+      );
+      if (outcome.action !== "send" || outcome.annotations.length === 0) {
+        const status = outcome.action === "send" ? "no_annotations" : outcome.action;
+        return [text({ projectId, file: outcome.file, status, note: "No revision was sent to Claude Design." })];
+      }
+      const message = annotationMessage(outcome.file, outcome.annotations);
+      const sent = await callDaemon<CheckResult>("reply", { projectId, message }, 180_000);
+      const remainingSec = Math.floor((started + CALL_BUDGET_MS - Date.now()) / 1000) - 60;
+      return settleAndShow(projectId, { ...sent, comments: outcome.annotations.map((item) => item.comment) }, {
+        timeoutSec: Math.max(10, Math.min(timeoutSec, remainingSec)),
+        preview,
+        pull,
+        projectDir,
+        dir,
+      });
     }),
 );
 

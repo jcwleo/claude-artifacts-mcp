@@ -51,7 +51,12 @@ const handlers: Record<string, (params: Params) => Promise<unknown>> = {
       dir: optionalString(params, "dir"),
       baseDir: optionalString(params, "baseDir"),
     }),
+  annotate_open: (params) => designs.openAnnotation({ projectId: requiredString(params, "projectId"), file: optionalString(params, "file") }),
+  annotate_wait: (params) =>
+    designs.waitAnnotation({ annotationId: requiredString(params, "annotationId"), timeoutSec: optionalNumber(params, "timeoutSec") ?? 420 }),
 };
+
+const UNSERIALIZED = new Set(["annotate_wait"]);
 
 let queue: Promise<unknown> = Promise.resolve();
 let inFlight = 0;
@@ -69,7 +74,8 @@ async function handle(request: DaemonRequest): Promise<DaemonResponse> {
   inFlight++;
   lastActivity = Date.now();
   try {
-    return { id: request.id, ok: true, result: await serialized(() => handler(request.params ?? {})) };
+    const call = () => handler(request.params ?? {});
+    return { id: request.id, ok: true, result: await (UNSERIALIZED.has(request.method) ? call() : serialized(call)) };
   } catch (error) {
     const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
     if (error instanceof NotLoggedInError) designs.reset();
