@@ -1,0 +1,24 @@
+{
+  "name": "claude-design-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Personal MCP that drives Claude Design (claude.ai Design artifacts) from omo through a dedicated Chrome profile.",
+  "type": "module",
+  "bin": {
+    "claude-design-mcp": "src/mcp.ts"
+  },
+  "scripts": {
+    "start": "bun src/mcp.ts",
+    "daemon": "bun src/daemon.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "typescript": "5"
+  }
+}
